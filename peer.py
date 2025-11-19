@@ -1,11 +1,4 @@
-"""
-peer.py -- Simple P2P Conf-Chat starter implementation (Python)
-Usage:
-    python3 peer.py --port 8001
-    python3 peer.py --port 8002 --bootstrap 127.0.0.1:8001
-Open multiple terminals with different ports to simulate multiple peers.
-Each peer provides an interactive CLI.
-"""
+#!/usr/bin/env python3
 
 import argparse
 import json
@@ -26,197 +19,203 @@ class PeerNode:
         self.port = port
         self.addr = (host, port)
 
-        # Known peers
-        self.known_peers: List[Tuple[str,int]] = []
-        for b in bootstrap:
-            if b != self.addr:
-                self.known_peers.append(b)
+        self.known_peers = bootstrap[:] if bootstrap else []
+        if self.addr in self.known_peers:
+            self.known_peers.remove(self.addr)
 
-        self.user_db: Dict[str, Dict] = {}      # username -> {password, fullname}
-        self.online_map: Dict[str, Tuple[str,int]] = {}  # username -> addr
-        self.friend_map: Dict[str, set] = {}    # username -> set of friends
+        self.user_db: Dict[str, Dict] = {}
+        self.online_map: Dict[str, Tuple[str,int]] = {}
         self.offline_store: Dict[str, List[Dict]] = {}
-        self.chats: Dict[str, Dict] = {}
-        self.session_user: str = None
+        self.session_user = None
 
-        # Start background listener
         threading.Thread(target=self._server_loop, daemon=True).start()
-        for peer in list(self.known_peers):
+        threading.Thread(target=self._maintain_loop, daemon=True).start()
+
+        # Announce presence
+        for p in self.known_peers:
             try:
-                self._send_message(peer, {"type":"peer_hello", "from":{"host":self.host,"port":self.port}})
-            except Exception:
+                self._send_message(p, {"type": "peer_hello", "from": self._self_info()})
+            except:
                 pass
 
-        threading.Thread(target=self._maintain_loop, daemon=True).start()
+    def _self_info(self):
+        return {"host": self.host, "port": self.port}
 
     def _server_loop(self):
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind((self.host, self.port))
+        s.bind(self.addr)
         s.listen(10)
         print(f"[{self.port}] Listening on {self.host}:{self.port}")
+
         while True:
             conn, addr = s.accept()
-            threading.Thread(target=self._handle_conn, args=(conn,addr), daemon=True).start()
+            threading.Thread(target=self._handle_conn, args=(conn,), daemon=True).start()
 
-    def _handle_conn(self, conn, addr):
+    def _handle_conn(self, conn):
         with conn:
             data = b""
             while True:
                 chunk = conn.recv(4096)
-                if not chunk:
-                    break
+                if not chunk: break
                 data += chunk
                 while b"\n" in data:
-                    line, data = data.split(b"\n",1)
+                    line, data = data.split(b"\n", 1)
                     try:
                         msg = json.loads(line.decode())
-                        self._handle_message(msg, addr)
+                        self._handle_message(msg)
                     except Exception:
                         traceback.print_exc()
 
     def _send_message(self, peer, msg):
-        host, port = peer
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(3)
         try:
-            s.connect((host, port))
-            s.sendall((json.dumps(msg)+"\n").encode())
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect(peer)
+            s.sendall((json.dumps(msg) + "\n").encode())
+        except:
+            pass
         finally:
             s.close()
 
-    # === Message handlers ===
-    def _handle_message(self, msg, addr):
-        t = msg.get("type")
-        if t == "peer_hello":
-            p = msg["from"]
-            peer = (p["host"], p["port"])
+    def _gossip(self, msg):
+        for peer in self.known_peers:
+            if peer != self.addr:
+                self._send_message(peer, msg)
+
+    def _handle_message(self, msg):
+        msg_type = msg.get("type")
+
+        if msg_type == "peer_hello":
+            peer = (msg["from"]["host"], msg["from"]["port"])
             if peer not in self.known_peers and peer != self.addr:
                 self.known_peers.append(peer)
-            self._send_message(peer, {"type":"peer_state","known_peers":self.known_peers})
-        elif t == "peer_state":
-            for p in msg.get("known_peers", []):
-                peer = tuple(p) if isinstance(p, list) else (p["host"],p["port"])
-                if peer not in self.known_peers and peer != self.addr:
-                    self.known_peers.append(peer)
-        elif t == "register_user":
-            u = msg["username"]; d = msg["data"]
-            if u not in self.user_db: self.user_db[u] = d
-            self._gossip(msg, exclude=[addr])
-        elif t == "login_announce":
-            u = msg["username"]; h = msg["host"]; p = msg["port"]
-            self.online_map[u] = (h,p)
-            if u in self.offline_store:
-                for pm in self.offline_store[u]:
-                    self._send_message((h,p), {"type":"deliver_message",**pm,"to_user":u})
-                self.offline_store[u] = []
-        elif t == "deliver_message":
-            if self.session_user == msg["to_user"]:
-                print(f"\n[{msg['from_user']}] -> you: {msg['text']}\n> ", end="")
-            else:
-                self.offline_store.setdefault(msg["to_user"],[]).append(msg)
-        elif t == "direct_message":
-            if self.session_user == msg["to_user"]:
-                print(f"\n[{msg['from_user']}] -> you: {msg['text']}\n> ", end="")
-            else:
-                self.offline_store.setdefault(msg["to_user"],[]).append(msg)
-        elif t == "chat_message":
-            cid = msg["chat_id"]; from_user = msg["from_user"]
-            text = msg["text"]
-            if cid in self.chats:
-                ch = self.chats[cid]
-                ch["messages"].append({"from":from_user,"text":text})
-                if self.session_user in ch["participants"]:
-                    print(f"\n[{ch['name']}] {from_user}: {text}\n> ", end="")
-            else:
-                self.offline_store.setdefault("chats",[]).append(msg)
-        elif t == "create_chat":
-            self.chats[msg["chat_id"]] = msg["info"]
+            self._send_message(peer, {"type": "peer_state", "peers": self.known_peers})
+
+        elif msg_type == "peer_state":
+            for p in msg.get("peers", []):
+                if tuple(p) not in self.known_peers and tuple(p) != self.addr:
+                    self.known_peers.append(tuple(p))
+
+        elif msg_type == "register_user":
+            self.user_db[msg["username"]] = msg["data"]
+            self._gossip(msg)
+
+        elif msg_type == "login_announce":
+            self.online_map[msg["username"]] = (msg["host"], msg["port"])
+            self._deliver_offline_messages(msg["username"])
+
+        elif msg_type == "deliver_message":
+            self._display_or_store(msg)
+
+        elif msg_type == "direct_message":
+            self._display_or_store(msg)
+
         else:
-            pass
+            print(f"[DEBUG] Unknown message received: {msg}")
 
-    def _gossip(self, msg, exclude=[]):
-        for p in self.known_peers:
-            if p not in exclude and p != self.addr:
-                try: self._send_message(p,msg)
-                except: pass
+    def _display_or_store(self, msg):
+        to_user = msg.get("to_user")
+        if not to_user:
+            print("[WARNING] Message missing 'to_user':", msg)
+            return
 
-    # === CLI functions ===
-    def register(self,u,pw,name):
-        if u in self.user_db:
-            print("Username exists."); return
-        self.user_db[u]={"password":pw,"fullname":name}
-        self._gossip({"type":"register_user","username":u,"data":self.user_db[u]})
+        if self.session_user == to_user:
+            print(f"\n[{msg['from_user']}] -> you: {msg['text']}\n> ", end="")
+        else:
+            self.offline_store.setdefault(to_user, []).append(msg)
+
+    def register(self, username, password, fullname):
+        if username in self.user_db:
+            print("Username exists.")
+            return
+        data = {"password": password, "fullname": fullname}
+        self.user_db[username] = data
+        self._gossip({"type": "register_user", "username": username, "data": data})
         print("Registered.")
 
-    def login(self,u,pw):
-        if u not in self.user_db or self.user_db[u]["password"]!=pw:
-            print("Invalid."); return
-        self.session_user=u
-        self.online_map[u]=self.addr
-        self._gossip({"type":"login_announce","username":u,"host":self.host,"port":self.port})
+    def login(self, username, password):
+        if self.user_db.get(username, {}).get("password") != password:
+            print("Invalid login.")
+            return
+
+        self.session_user = username
+        self.online_map[username] = self.addr
+        self._gossip({"type": "login_announce", "username": username, "host": self.host, "port": self.port})
+        self._deliver_offline_messages(username)
         print("Logged in.")
 
-    def send_message(self,to,text):
-        if not self.session_user: print("Login first"); return
-        if to in self.online_map:
-            self._send_message(self.online_map[to],{"type":"deliver_message","from_user":self.session_user,"text":text})
+    def _deliver_offline_messages(self, username):
+        if username in self.offline_store:
+            for msg in self.offline_store[username]:
+                self._send_message(self.online_map[username], {"type": "deliver_message", **msg})
+            self.offline_store[username] = []
+
+    def send_message(self, to_user, text):
+        if not self.session_user:
+            print("Login first.")
+            return
+
+        msg = {
+            "type": "deliver_message",
+            "from_user": self.session_user,
+            "to_user": to_user,
+            "text": text
+        }
+
+        target = self.online_map.get(to_user)
+        if target:
+            self._send_message(target, msg)
             print("Delivered.")
         else:
-            self.offline_store.setdefault(to,[]).append({"from_user":self.session_user,"text":text})
-            self._gossip({"type":"direct_message","from_user":self.session_user,"to_user":to,"text":text})
-            print("Stored offline and broadcast.")
+            self._gossip(msg)
+            self.offline_store.setdefault(to_user, []).append(msg)
+            print("Recipient offline → message stored!")
 
-    def create_chat(self,cid,name,participants):
-        if not self.session_user: print("Login first"); return
-        info={"name":name,"participants":participants+[self.session_user],"messages":[]}
-        self.chats[cid]=info
-        self._gossip({"type":"create_chat","chat_id":cid,"info":info})
-        print("Chat created.")
-    def send_chat_message(self,cid,text):
-        if not self.session_user: print("Login first"); return
-        if cid not in self.chats: print("Unknown chat"); return
-        self._gossip({"type":"chat_message","chat_id":cid,"from_user":self.session_user,"text":text})
-        print("Broadcast to chat.")
     def _maintain_loop(self):
         while True:
             time.sleep(10)
-            try: self._gossip({"type":"peer_state","known_peers":self.known_peers})
-            except: pass
-def repl(node):
-    helptext="""
-Commands:
- register <username> <password> <fullname>
- login <username> <password>
- send <username> <message>
- create_chat <id> <name> <user1,user2,...>
- chat_send <id> <message>
- help
- exit
-"""
-    print(helptext)
+            self._gossip({"type": "peer_state", "peers": self.known_peers})
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, required=True)
+    ap.add_argument("--bootstrap", default="")
+    args = ap.parse_args()
+
+    bootstrap = []
+    if args.bootstrap:
+        host, port = args.bootstrap.split(":")
+        bootstrap = [(host, int(port))]
+
+    peer = PeerNode(args.host, args.port, bootstrap)
+
     while True:
-        cmd=input("> ").strip().split()
-        if not cmd: continue
-        if cmd[0]=="register" and len(cmd)>=4:
-            node.register(cmd[1],cmd[2]," ".join(cmd[3:]))
-        elif cmd[0]=="login" and len(cmd)==3:
-            node.login(cmd[1],cmd[2])
-        elif cmd[0]=="send" and len(cmd)>=3:
-            node.send_message(cmd[1]," ".join(cmd[2:]))
-        elif cmd[0]=="create_chat" and len(cmd)>=4:
-            node.create_chat(cmd[1],cmd[2],cmd[3].split(","))
-        elif cmd[0]=="chat_send" and len(cmd)>=3:
-            node.send_chat_message(cmd[1]," ".join(cmd[2:]))
-        elif cmd[0]=="help": print(helptext)
-        elif cmd[0]=="exit": break
-if __name__=="__main__":
-    ap=argparse.ArgumentParser()
-    ap.add_argument("--host",default="127.0.0.1")
-    ap.add_argument("--port",type=int,required=True)
-    ap.add_argument("--bootstrap",default="")
-    a=ap.parse_args()
-    boots=[tuple(x.split(":")) for x in a.bootstrap.split(",") if x]
-    boots=[(h,int(p)) for h,p in boots]
-    n=PeerNode(a.host,a.port,boots)
-    repl(n)
+        try:
+            cmd = input("> ").strip().split()
+        except EOFError:
+            break
+
+        if not cmd:
+            continue
+
+        if cmd[0] == "register" and len(cmd) >= 4:
+            peer.register(cmd[1], cmd[2], " ".join(cmd[3:]))
+
+        elif cmd[0] == "login" and len(cmd) == 3:
+            peer.login(cmd[1], cmd[2])
+
+        elif cmd[0] == "send" and len(cmd) >= 3:
+            peer.send_message(cmd[1], " ".join(cmd[2:]))
+
+        elif cmd[0] == "exit":
+            print("Bye.")
+            break
+
+        else:
+            print("Commands: register, login, send, exit")
+
+
+if __name__ == "__main__":
+    main()
