@@ -8,6 +8,9 @@ Each peer is a standalone Python program that can:
 - Send and receive direct messages (online/offline)
 - Create and participate in conference chats
 - Discover peers dynamically
+- Stores message if user is not online.
+- sadly does not allow multiple messaging of more than one users at a time.
+- does not remember users 
 
 ## Installation
 Requirements: Python 3.8+
